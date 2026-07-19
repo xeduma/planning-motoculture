@@ -1,79 +1,159 @@
-# DDVS Motoculture — Backend
+# DDVS Repair Queue — File d'Atelier
 
-Backend du dashboard de gestion des réparations, avec intégration à l'API VosFactures.
+Tableau de bord de gestion des réparations pour DDVS Motoculture.  
+Affiche les machines à réparer triées par urgence et délai, en vue Kanban ou Liste.
 
-## Stack
+---
 
-- **Node.js + Express** (choisi pour rester cohérent avec le reste de ton infra Node.js/SQLite déjà en place)
-- **better-sqlite3** : base locale simple, synchrone, aucun serveur à gérer — sert de file d'attente des machines et de cache des factures
-- Écoute **uniquement en local** (`127.0.0.1:8410`), jamais sur `0.0.0.0` — Nginx fera le reverse-proxy en 443
+## Installation Debian 13
 
-> Note : tu avais demandé un `requirements.txt` (convention Python). Ici la stack est Node.js, donc l'équivalent est `package.json` (liste des dépendances + version). Dis-moi si tu préfères repartir sur un backend Python (FastAPI par ex.) — je peux le refaire avec un vrai `requirements.txt`.
-
-## Installation
+### 1. Prérequis système
 
 ```bash
-cd ddvs-backend
-cp .env.example .env      # puis remplis les valeurs (token VosFactures, routes exactes...)
-npm install
-npm start                 # ou: npm run dev (auto-reload)
+apt install -y nodejs npm python3 make g++ build-essential nginx
+# Node >= 18 requis
+node -v
 ```
 
-## Variables d'environnement (.env)
+### 2. Backend
 
-Toutes les variables sont documentées dans `.env.example`. Points clés :
+```bash
+cd backend
+cp .env.example .env
+# Éditer .env avec tes valeurs
+nano .env
 
-- `VOSFACTURES_API_BASE_URL` : déjà rempli avec `http://localhost:8402`
-- `VOSFACTURES_ROUTE_SYNC` / `_INVOICES` / `_HEALTH` : routes par défaut (`/sync`, `/invoices`, `/health`), à ajuster quand tu confirmeras
-- `VOSFACTURES_API_TOKEN` : à remplir si l'API demande une authentification
-- `VOSFACTURES_CACHE_DB_*` : prévu si jamais tu veux connecter directement la base de cache de VosFactures en plus de l'API HTTP (laisse vide pour l'instant, non utilisé actuellement)
-- `SYNC_CRON_SCHEDULE` : vide par défaut = pas de sync automatique, uniquement le bouton manuel
+npm install
+node server.js
+# → Écoute sur http://127.0.0.1:8410
+```
 
-## Routes exposées par CE backend (celui que le frontend Vue appellera)
+Pour tourner en production avec systemd :
+```bash
+# Copier repair-queue.service dans /etc/systemd/system/
+systemctl enable repair-queue
+systemctl start repair-queue
+```
 
-### Machines / file d'attente
-| Méthode | Route | Description |
-|---|---|---|
-| GET | `/api/machines` | Liste triée par urgence puis date de dépôt |
-| GET | `/api/machines?status=en_attente` | Filtrée par statut |
-| GET | `/api/machines/:id` | Détail d'une machine |
-| POST | `/api/machines` | Créer une entrée (urgence auto-calculée si non fournie) |
-| PATCH | `/api/machines/:id` | Modifier les infos générales |
-| PATCH | `/api/machines/:id/status` | Changer le statut manuellement (`en_attente`, `en_cours`, `termine`) |
-| PATCH | `/api/machines/:id/urgency` | Changer le facteur d'urgence manuellement (1, 2 ou 3) |
-| DELETE | `/api/machines/:id` | Supprimer |
+### 3. Frontend
 
-### VosFactures
-| Méthode | Route | Description |
-|---|---|---|
-| POST | `/api/sync` | Bouton "Synchroniser" → appelle `/sync` puis `/invoices` de VosFactures, met à jour le cache et les statuts |
-| GET | `/api/sync/last` | Dernier résultat de synchro connu |
-| GET | `/api/invoices` | Factures en cache local |
-| GET | `/api/health` | Statut de l'API VosFactures + infos dernière synchro |
+```bash
+cd frontend
+npm install
+npm run build
+# → Génère frontend/dist/
 
-## Logique métier implémentée
+# Copier dans le dossier Nginx
+cp -r dist/* /var/www/repair-queue/
+```
 
-**Facteur d'urgence automatique** (`src/services/urgency.service.js`) :
-- `1 (urgent, rouge)` : réparation pour un client professionnel
-- `2 (moyen, orange)` : toute autre réparation
-- `3 (faible, gris)` : diagnostic de panne, ou machine d'occasion
+### 4. Nginx
 
-Modifiable à la main via `PATCH /api/machines/:id/urgency` (pose un flag `urgency_manual_override` pour tracer que ce n'est plus la valeur auto).
+```bash
+# Générer un certificat auto-signé (ou utiliser le tien)
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/ssl/private/ddvs-repair.key \
+  -out /etc/ssl/certs/ddvs-repair.crt
 
-**Tri d'affichage** : `ORDER BY urgency_level ASC, deposit_date ASC` — l'urgence prime toujours, la date ne départage qu'à urgence égale (conforme à ton exemple tracteur-tondeuse vs diagnostic).
+# Copier la config Nginx
+cp nginx/repair-queue.conf /etc/nginx/sites-available/repair-queue
+ln -s /etc/nginx/sites-available/repair-queue /etc/nginx/sites-enabled/
+nginx -t && systemctl reload nginx
+```
 
-**Statut & délais** :
-- Nouvelle machine → `en_attente`
-- Modifiable manuellement en `en_cours` / `termine`
-- Passage automatique en `termine` lors de la synchro si la facture liée (`invoice_id`) est marquée payée côté VosFactures — sauf si un statut manuel a déjà été posé (`status_manual_override`)
+---
 
-## Ce qui reste à confirmer de ton côté
+## Configuration `.env` backend
 
-1. Le format exact des routes VosFactures (`/sync`, `/invoices`, `/health`) et leur méthode HTTP réelle
-2. Le format JSON réellement renvoyé par `/invoices` (le mapping dans `sync.service.js` est tolérant mais à ajuster une fois la vraie réponse connue)
-3. Si un token est nécessaire pour appeler l'API
-4. Si la "base de données en cache" est une base séparée à interroger directement, ou juste le cache interne de l'API VosFactures (dans ce cas rien à faire ici, l'API HTTP suffit)
+| Variable          | Description                                      | Défaut                    |
+|-------------------|--------------------------------------------------|---------------------------|
+| `PORT`            | Port backend                                     | `8410`                    |
+| `JWT_SECRET`      | Secret de signature JWT                          | *(à changer)*             |
+| `ADMIN_USERNAME`  | Identifiant de connexion                         | `admin`                   |
+| `ADMIN_PASSWORD`  | Mot de passe dashboard                           | `admin123`                |
+| `DDVS_API_URL`    | URL de l'API principale DDVS                     | `http://localhost:8402/api`|
+| `DDVS_API_TOKEN`  | Token JWT de l'API DDVS (pour sync factures)     | *(vide)*                  |
+| `DB_PATH`         | Chemin SQLite                                    | `./data/repair_queue.db`  |
 
-## Prochaine étape
+---
 
-Une fois ce backend validé, je peux enchaîner sur le frontend Vue 3 (vue liste triée par urgence avec badges colorés, ou vue Kanban par statut — mon conseil : liste simple triée par urgence pour la vue "priorité du jour", éventuellement un Kanban en option secondaire par statut).
+## API Backend
+
+### Auth
+| Méthode | Route              | Description          |
+|---------|--------------------|----------------------|
+| POST    | `/api/auth/login`  | Connexion → JWT      |
+| POST    | `/api/auth/verify` | Vérifier token       |
+
+### Machines
+| Méthode | Route                  | Description                        |
+|---------|------------------------|------------------------------------|
+| GET     | `/api/machines`        | Liste kanban ou flat (view=kanban) |
+| GET     | `/api/machines/today`  | Top 10 machines prioritaires       |
+| GET     | `/api/machines/:id`    | Détail + historique                |
+| POST    | `/api/machines`        | Ajouter une machine                |
+| PATCH   | `/api/machines/:id`    | Modifier statut / urgence / notes  |
+| DELETE  | `/api/machines/:id`    | Marquer comme livré                |
+
+### Sync & Stats
+| Méthode | Route         | Description                             |
+|---------|---------------|-----------------------------------------|
+| GET     | `/api/health` | État du serveur et connexion API DDVS   |
+| POST    | `/api/sync`   | Sync avec VosFactures (factures payées) |
+| GET     | `/api/stats`  | Statistiques globales                   |
+
+---
+
+## Logique d'urgence
+
+| Niveau | Couleur | Déclencheur                                    | Seuil délai critique |
+|--------|---------|------------------------------------------------|----------------------|
+| 1      | 🔴 Rouge  | Client professionnel                           | J+3                  |
+| 2      | 🟠 Orange | Toute réparation standard                      | J+7                  |
+| 3      | ⚫ Gris   | Diagnostic, remise en état occasion, entretien | J+14                 |
+
+L'urgence est calculée automatiquement à l'ajout, mais peut être écrasée manuellement.
+
+---
+
+## Synchronisation avec VosFactures
+
+La synchronisation (bouton ou `POST /api/sync`) :
+1. Récupère les factures **payées du jour** via l'API DDVS (port 8402)
+2. Cherche les machines avec un `invoice_number` correspondant
+3. Les passe automatiquement en statut `done`
+
+Pour activer la sync, configurer `DDVS_API_TOKEN` avec un token JWT valide de l'API principale.
+
+---
+
+## Arborescence
+
+```
+repair-queue/
+├── backend/
+│   ├── server.js       ← Point d'entrée Express
+│   ├── db.js           ← Schéma SQLite
+│   ├── auth.js         ← JWT + login
+│   ├── urgency.js      ← Calcul priorité
+│   ├── ddvs.js         ← Client API principale
+│   ├── .env.example
+│   ├── requirements.txt
+│   └── package.json
+├── frontend/
+│   ├── src/
+│   │   ├── views/
+│   │   │   ├── LoginView.vue
+│   │   │   ├── KanbanView.vue   ← Vue principale
+│   │   │   └── ListeView.vue    ← Objectifs du jour
+│   │   ├── components/
+│   │   │   ├── MachineCard.vue  ← Carte avec barre délai
+│   │   │   └── MachineForm.vue  ← Formulaire ajout/édition
+│   │   ├── stores/
+│   │   │   ├── machines.js
+│   │   │   └── toast.js
+│   │   └── assets/base.css
+│   └── package.json
+└── nginx/
+    └── repair-queue.conf
+```
